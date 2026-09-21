@@ -1,0 +1,26 @@
+# Kubernetes Service 示例
+# 搭配同目录下的 deployment.yml 使用，让集群内部/外部可以访问 Pod。
+# 贡献者：c991china（跨账号 PR 共笔）
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-service
+  labels:
+    app: demo
+spec:
+  type: ClusterIP
+  selector:
+    app: demo
+    tier: frontend
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8000
+---
+# 如需对外暴露，可改用 NodePort / LoadBalancer：
+#   type: NodePort
+#   ports:
+#     - port: 80
+#       targetPort: 8000
+#       nodePort: 30080
