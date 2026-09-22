@@ -1,28 +1,138 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: web
+  name: web-api
+  namespace: apps
   labels:
-    app: web
+    app.kubernetes.io/name: web-api
+    app.kubernetes.io/instance: web-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/version: "1.8.3"
+    app.kubernetes.io/managed-by: kubectl
+  annotations:
+    # Keeps `kubectl rollout undo` useful without the history growing forever.
+    deployment.kubernetes.io/revision: "12"
 spec:
-  replicas: 2
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never drop below the desired count. With 3 replicas and maxUnavailable 0
+      # a bad rollout just stalls instead of taking the service down.
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
-      app: web
+      app.kubernetes.io/name: web-api
+      app.kubernetes.io/instance: web-api
   template:
     metadata:
       labels:
-        app: web
+        app.kubernetes.io/name: web-api
+        app.kubernetes.io/instance: web-api
+        app.kubernetes.io/component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
+      serviceAccountName: web-api
+      # preStop sleeps 5s and the grace period is 30s: long enough for the
+      # endpoint to be removed from the Service before the process gets SIGKILL.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: web-api
+      imagePullSecrets:
+        - name: ghcr-pull
       containers:
-        - name: web
-          image: nginx:alpine
+        - name: api
+          image: ghcr.io/22178384/web-api:1.8.3
+          imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 80
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: APP_ENV
+              value: production
+            - name: LOG_LEVEL
+              value: info
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: web-api-secrets
+                  key: database-url
+            - name: REDIS_URL
+              value: redis://redis-master.apps.svc.cluster.local:6379/0
+          envFrom:
+            - configMapRef:
+                name: web-api-config
           resources:
             requests:
-              cpu: "50m"
-              memory: "64Mi"
+              cpu: 100m
+              memory: 192Mi
             limits:
-              cpu: "200m"
-              memory: "128Mi"
+              cpu: 500m
+              memory: 384Mi
+          # startupProbe covers slow cold starts; while it runs the other two
+          # probes are suspended, so I don't need a huge initialDelaySeconds.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - sleep 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            # readOnlyRootFilesystem means anything that writes to /tmp needs
+            # a writable mount. Python's tempfile module is the usual culprit.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
