@@ -1,7 +1,119 @@
+# Prometheus config for the home-lab cluster. Reload with:
+#   curl -X POST http://localhost:9090/-/reload
+# (needs --web.enable-lifecycle on the Prometheus container)
 global:
   scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+  external_labels:
+    cluster: home-lab
+    # Prometheus federation requires a unique replica label or you get
+    # duplicate-series errors when you try to aggregate two of them.
+    replica: "0"
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
 
 scrape_configs:
-  - job_name: "prometheus"
+  # Prometheus scraping itself. Cheap, and it's how you notice scrape failures.
+  - job_name: prometheus
     static_configs:
-      - targets: ["localhost:9090"]
+      - targets:
+          - localhost:9090
+
+  - job_name: node
+    static_configs:
+      - targets:
+          - node-exporter:9100
+        labels:
+          env: prod
+          role: host
+
+  # Pod discovery. Relies on the prometheus.io/* annotations set in the
+  # Deployment. If a pod doesn't show up, check the annotation names first.
+  - job_name: kubernetes-pods
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels:
+          - __meta_kubernetes_pod_annotation_prometheus_io_scrape
+        action: keep
+        regex: "true"
+      - source_labels:
+          - __meta_kubernetes_pod_annotation_prometheus_io_scheme
+        action: replace
+        target_label: __scheme__
+        regex: (https?)
+      - source_labels:
+          - __meta_kubernetes_pod_annotation_prometheus_io_path
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      # Pod address is "ip:port"; replace the port with the annotated one.
+      - source_labels:
+          - __address__
+          - __meta_kubernetes_pod_annotation_prometheus_io_port
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels:
+          - __meta_kubernetes_namespace
+        action: replace
+        target_label: namespace
+      - source_labels:
+          - __meta_kubernetes_pod_name
+        action: replace
+        target_label: pod
+      - source_labels:
+          - __meta_kubernetes_pod_container_name
+        action: replace
+        target_label: container
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+
+  # Blackbox probes. The __param_target dance is the documented pattern; it
+  # looks wrong the first time you read it, it is not.
+  - job_name: blackbox-http
+    metrics_path: /probe
+    params:
+      module:
+        - http_2xx
+    static_configs:
+      - targets:
+          - https://api.example.com/healthz
+          - https://example.com
+    relabel_configs:
+      - source_labels:
+          - __address__
+        target_label: __param_target
+      - source_labels:
+          - __param_target
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  - job_name: blackbox-tcp
+    metrics_path: /probe
+    params:
+      module:
+        - tcp_connect
+    static_configs:
+      - targets:
+          - postgres:5432
+          - redis:6379
+    relabel_configs:
+      - source_labels:
+          - __address__
+        target_label: __param_target
+      - source_labels:
+          - __param_target
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
