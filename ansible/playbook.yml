@@ -1,0 +1,169 @@
+---
+# Deploy web-api to a plain Debian/Ubuntu box. No k8s here on purpose: the
+# small stuff at home runs on one VM and systemd is fine for it.
+#
+#   ansible-playbook -i inventory.ini ansible/playbook.yml --check
+#   ansible-playbook -i inventory.ini ansible/playbook.yml
+#
+# inventory.ini is not in this repo (it has real hostnames in it):
+#
+#   [webservers]
+#   web01 ansible_host=10.0.20.11
+#
+# Needs community.general for the ufw module:
+#   ansible-galaxy collection install community.general
+- name: Provision and deploy web-api
+  hosts: webservers
+  become: true
+  gather_facts: true
+
+  vars:
+    app_name: web-api
+    app_user: deploy
+    app_dir: /srv/web-api
+    app_version: "1.8.3"
+    app_port: 8080
+    app_repo: https://github.com/22178384/data-tools.git
+    app_workers: 4
+    # Override on the command line for a one-off:
+    #   -e app_version=1.9.0
+    firewall_allowed_ports:
+      - { port: "22", proto: tcp }
+      - { port: "80", proto: tcp }
+      - { port: "443", proto: tcp }
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: restart web-api
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
+
+  tasks:
+    - name: Fail early on the wrong distro
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution in ["Debian", "Ubuntu"]
+        fail_msg: "This playbook only handles Debian/Ubuntu. Got {{ ansible_facts.distribution }}."
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name:
+          - python3-venv
+          - python3-pip
+          - git
+          - curl
+          - ufw
+          - ca-certificates
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create the app user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ app_dir }}"
+        create_home: false
+
+    - name: Create the app directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.owner }}"
+        mode: "0755"
+      loop:
+        - { path: "{{ app_dir }}", owner: root }
+        - { path: "{{ app_dir }}/releases", owner: "{{ app_user }}" }
+        - { path: "/var/log/{{ app_name }}", owner: "{{ app_user }}" }
+
+    - name: Check out the release
+      ansible.builtin.git:
+        repo: "{{ app_repo }}"
+        dest: "{{ app_dir }}/releases/{{ app_version }}"
+        version: "v{{ app_version }}"
+        depth: 1
+        # If the tag doesn't exist this fails here rather than halfway through
+        # a half-applied deploy.
+      notify: restart web-api
+
+    - name: Create the virtualenv
+      ansible.builtin.command:
+        cmd: "python3 -m venv {{ app_dir }}/venv"
+        creates: "{{ app_dir }}/venv/bin/python"
+
+    - name: Install Python dependencies
+      ansible.builtin.pip:
+        requirements: "{{ app_dir }}/releases/{{ app_version }}/requirements.txt"
+        virtualenv: "{{ app_dir }}/venv"
+        extra_args: "--no-cache-dir"
+      notify: restart web-api
+
+    - name: Point 'current' at the new release
+      ansible.builtin.file:
+        src: "{{ app_dir }}/releases/{{ app_version }}"
+        dest: "{{ app_dir }}/current"
+        state: link
+        force: true
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+      notify: restart web-api
+
+    - name: Install the environment file
+      ansible.builtin.template:
+        src: web-api.env.j2
+        dest: "/etc/{{ app_name }}.env"
+        owner: root
+        group: "{{ app_user }}"
+        mode: "0640"
+      notify: restart web-api
+
+    - name: Install the systemd unit
+      ansible.builtin.template:
+        src: web-api.service.j2
+        dest: "/etc/systemd/system/{{ app_name }}.service"
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - reload systemd
+        - restart web-api
+
+    - name: Enable and start the service
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        enabled: true
+        state: started
+
+    - name: Open the firewall ports we actually need
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+      loop: "{{ firewall_allowed_ports }}"
+
+    - name: Enable ufw, deny by default
+      community.general.ufw:
+        state: enabled
+        policy: deny
+        direction: incoming
+
+    - name: Wait for the health endpoint
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ app_port }}/healthz"
+        status_code: 200
+        timeout: 5
+      register: health
+      until: health.status == 200
+      retries: 10
+      delay: 3
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ app_name }} {{ app_version }} healthy on port {{ app_port }} ({{ ansible_facts.hostname }})"
