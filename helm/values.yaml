@@ -1,0 +1,179 @@
+# Values for the web-api chart. This is the "prod-ish" override, not the
+# chart defaults. Install with:
+#
+#   helm upgrade --install web-api ./charts/web-api \
+#     -n apps --create-namespace \
+#     -f helm/values.yaml
+#
+# The chart itself lives in a different repo. This file is the part that
+# actually changes between environments.
+
+replicaCount: 3
+
+image:
+  repository: ghcr.io/22178384/web-api
+  tag: "1.8.3"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ghcr-pull
+
+nameOverride: ""
+fullnameOverride: web-api
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+podLabels:
+  app.kubernetes.io/component: api
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: http
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  hosts:
+    - host: api.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: web-api-tls
+      hosts:
+        - api.example.com
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 192Mi
+  limits:
+    cpu: 500m
+    memory: 384Mi
+
+# The image is small and starts fast, so startupProbe is cheap insurance
+# against the occasional slow node.
+startupProbe:
+  enabled: true
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 2
+  failureThreshold: 30
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 2
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 12
+  targetCPUUtilizationPercentage: 70
+  # Memory-driven scaling is unreliable for this app (GC makes it spiky),
+  # so only CPU is configured.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+
+# Deliberately conservative. A deploy that removes two of three pods at once
+# has bitten me before on a Friday.
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+env:
+  APP_ENV: production
+  LOG_LEVEL: info
+  REDIS_URL: redis://redis-master.apps.svc.cluster.local:6379/0
+
+envFrom:
+  - configMapRef:
+      name: web-api-config
+
+# Nothing secret goes in here. These are refs into an ExternalSecret that
+# syncs from the vault. If you set `value` instead of `secretKeyRef` you are
+# putting a password in git and I will find out.
+extraEnv:
+  - name: DATABASE_URL
+    valueFrom:
+      secretKeyRef:
+        name: web-api-secrets
+        key: database-url
+
+nodeSelector:
+  kubernetes.io/os: linux
+
+tolerations: []
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: web-api
+
+metrics:
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+    labels:
+      release: kube-prometheus-stack
+
+postgresql:
+  # The in-chart Postgres is for local/staging only. Production points at a
+  # managed instance via DATABASE_URL.
+  enabled: false
+  auth:
+    database: app
+    username: app
+    existingSecret: web-api-postgres
