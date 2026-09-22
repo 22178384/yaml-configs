@@ -1,26 +1,26 @@
-# Kubernetes Service 示例
-# 搭配同目录下的 deployment.yml 使用，让集群内部/外部可以访问 Pod。
-# 贡献者：c991china（跨账号 PR 共笔）
 apiVersion: v1
 kind: Service
 metadata:
-  name: app-service
+  name: web-api
+  namespace: apps
   labels:
-    app: demo
+    app.kubernetes.io/name: web-api
+    app.kubernetes.io/instance: web-api
+    app.kubernetes.io/component: api
 spec:
   type: ClusterIP
+  # Selector must match the Deployment's pod template labels exactly.
+  # If these drift you get a Service with zero endpoints and a very confusing
+  # 503 from the ingress. `kubectl get endpoints web-api` is the check.
   selector:
-    app: demo
-    tier: frontend
+    app.kubernetes.io/name: web-api
+    app.kubernetes.io/instance: web-api
   ports:
     - name: http
-      protocol: TCP
       port: 80
-      targetPort: 8000
----
-# 如需对外暴露，可改用 NodePort / LoadBalancer：
-#   type: NodePort
-#   ports:
-#     - port: 80
-#       targetPort: 8000
-#       nodePort: 30080
+      # targetPort refers to the named container port, not a number. Renaming
+      # the port in the Deployment is then a one-line change here too.
+      targetPort: http
+      protocol: TCP
+  sessionAffinity: None
+  internalTrafficPolicy: Cluster
